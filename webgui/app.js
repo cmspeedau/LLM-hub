@@ -3,8 +3,8 @@
 /* ===========================================================================
    LLM Hub — web GUI
    ---------------------------------------------------------------------------
-   A Hugging Face style model browser that downloads GGUF models through
-   Ollama's pull path and serves them from the same daemon.
+   A Hugging Face style model browser that downloads raw GGUF files through the
+   runner sidecar and serves them with the llama.cpp server (LM Studio model).
 
    Two ideas keep this honest:
 
@@ -20,7 +20,9 @@
    =========================================================================== */
 
 const CFG = Object.assign({
-  ollama: '/ollama',
+  llama: '/llama',       // llama.cpp server (OpenAI-compatible API)
+  runner: '/downloader', // downloader / model manager sidecar
+  llamaPort: 8081,
   hf: 'https://huggingface.co',
   pageSize: 25,
   targetLabel: 'This device',
@@ -132,13 +134,14 @@ const state = {
   selectedId: null,
   detail: null,
   quant: null,
-  local: [],
-  running: [],
-  ollamaUp: true,
-  ollamaErr: null,
+  local: [],          // [{ file, size, mtime }] from the runner
+  active: null,       // currently loaded GGUF file name
+  engineUp: false,    // llama.cpp server reachable
+  runnerUp: false,    // runner sidecar reachable
+  runnerErr: null,
   offline: false,
   loading: true,
-  pulls: new Map(),
+  pulls: new Map(),   // `${repo}:${quant}` -> progress
   hw: DEFAULT_HW,
 };
 
@@ -179,7 +182,7 @@ const quantRank = (q) => {
   return i === -1 ? QUANT_ORDER.length + 1 : i;
 };
 
-/** Conservative f16 KV cost. Phase 1 replaces this with real GGUF header values. */
+/** Conservative f16 KV cost. Replace with real GGUF header values when wired. */
 const KV_BYTES_PER_TOKEN_PER_B = 12000;
 
 function kvGB(paramsBillion, ctx, kvType) {
@@ -496,39 +499,42 @@ function firstParagraph(md) {
 }
 
 /* ==================================================================== */
-/*  Ollama API                                                           */
+/*  Runner + engine API                                                  */
 /* ==================================================================== */
 
-async function ollama(path, options) {
-  const r = await fetch(`${CFG.ollama}${path}`, options);
+async function runner(path, options) {
+  const r = await fetch(`${CFG.runner}${path}`, options);
   if (!r.ok) throw new Error(`${path} -> ${r.status}`);
   return r;
 }
 
+/** Refresh the model list, the active model, and whether the engine is up. */
 async function loadLocal() {
   try {
-    const [tags, ps] = await Promise.all([
-      ollama('/api/tags').then((r) => r.json()),
-      ollama('/api/ps').then((r) => r.json()),
+    const [models, engine] = await Promise.all([
+      runner('/api/models').then((r) => r.json()),
+      fetch(`${CFG.llama}/health`).then((r) => r.ok).catch(() => false),
     ]);
-    state.local = tags.models || [];
-    state.running = ps.models || [];
-    state.ollamaUp = true;
-    state.ollamaErr = null;
+    state.local = models.models || [];
+    state.active = models.active || null;
+    state.runnerUp = true;
+    state.runnerErr = null;
+    state.engineUp = Boolean(engine) && Boolean(state.active);
   } catch (err) {
-    state.ollamaUp = false;
-    state.ollamaErr = err.message || String(err);
+    state.runnerUp = false;
+    state.runnerErr = err.message || String(err);
+    state.engineUp = false;
     state.local = [];
-    state.running = [];
+    state.active = null;
   }
 }
 
-/** Stream /api/pull so the button can show real progress. */
-async function pullModel(ref, onEvent) {
-  const r = await ollama('/api/pull', {
+/** Stream a download from the runner. Progress arrives as NDJSON lines. */
+async function downloadModel(repo, files, onEvent) {
+  const r = await runner('/api/download', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ model: ref, stream: true }),
+    body: JSON.stringify({ repo, files }),
   });
   const reader = r.body.getReader();
   const decoder = new TextDecoder();
@@ -548,11 +554,7 @@ async function pullModel(ref, onEvent) {
   if (buffer.trim()) { try { onEvent(JSON.parse(buffer.trim())); } catch { /* ignore */ } }
 }
 
-const isServed = (name) => state.running.some((m) => m.name === name || m.model === name);
-
-function servedInfo(name) {
-  return state.running.find((m) => m.name === name || m.model === name) || null;
-}
+const isServed = (file) => state.engineUp && state.active === file;
 
 /* ==================================================================== */
 /*  Views                                                                */
@@ -621,6 +623,7 @@ function renderDiscoverList() {
     if (model) hydrateRow(model, row);
   });
 }
+
 function hydrateRow(model, row) {
   hfAvatar(model.id).then((url) => {
     if (!url) return;
@@ -761,9 +764,11 @@ function renderDetail() {
   const { model: hfModel, gguf, readme, fitInfo } = state.detail;
   const quantList = fitInfo.quants.slice().sort((a, b) => quantRank(a.quant) - quantRank(b.quant) || a.sizeGB - b.sizeGB);
   const chosen = quantList.find((q) => q.quant === state.quant) || quantList[0];
-  const ref = chosen ? `hf.co/${state.selectedId}:${chosen.quant}` : null;
-  const local = state.local.find((m) => m.name === ref);
-  const pull = ref ? state.pulls.get(ref) : null;
+  const chosenMeta = chosen && state.detail.meta ? state.detail.meta[chosen.quant] : null;
+  const chosenFile = chosenMeta ? chosenMeta.file : null;
+  const pullKey = `${state.selectedId}:${chosen ? chosen.quant : ''}`;
+  const pull = state.pulls.get(pullKey);
+  const localEntry = chosenFile ? state.local.find((m) => m.file === chosenFile) : null;
 
   const caps = capabilitiesOf(hfModel, gguf);
   const ctxLen = gguf.context_length;
@@ -814,10 +819,10 @@ function renderDetail() {
       ${pull ? progressHtml(pull) : ''}
 
       <div class="dl-row">
-        ${local
-          ? `<button class="btn-ghost danger" data-act="delete" data-name="${esc(local.name)}">Remove</button>
-             <button class="btn-primary" style="margin-left:8px" data-act="serve" data-name="${esc(local.name)}">
-               ${svg(ICON.play)}${isServed(local.name) ? 'Serving' : 'Load'}</button>`
+        ${localEntry
+          ? `<button class="btn-ghost danger" data-act="delete" data-file="${esc(localEntry.file)}">Remove</button>
+             <button class="btn-primary" style="margin-left:8px" data-act="serve" data-file="${esc(localEntry.file)}">
+               ${svg(ICON.play)}${isServed(localEntry.file) ? 'Serving' : 'Load'}</button>`
           : `<button class="btn-primary" id="downloadBtn" ${pull && !pull.done ? 'disabled' : ''}>
                ${svg(ICON.download)}${pull && pull.done ? 'Downloaded' : `Download ${chosen ? fmtBytes(chosen.sizeGB * 1e9) : ''}`}
              </button>`}
@@ -842,7 +847,7 @@ function renderDetail() {
     <div class="box"><div class="readme">${renderMarkdown(readme) || '<p class="empty">No README.</p>'}</div></div>
   </div>`;
 
-  wireDetail(quantList, ref);
+  wireDetail(quantList, state.selectedId, chosenFile, pullKey);
 }
 
 function progressHtml(p) {
@@ -859,7 +864,7 @@ function progressHtml(p) {
   </div>`;
 }
 
-function wireDetail(quantList, ref) {
+function wireDetail(quantList, repoId, chosenFile, pullKey) {
   const qrow = $('#qrow');
   const qmenu = $('#qmenu');
 
@@ -881,34 +886,36 @@ function wireDetail(quantList, ref) {
   }
 
   const dl = $('#downloadBtn');
-  if (dl && ref) dl.addEventListener('click', () => startDownload(ref));
+  if (dl && chosenFile) {
+    dl.addEventListener('click', () => startDownload(repoId, chosenFile, chosenFile, pullKey));
+  }
 
   $$('[data-act]', mainEl).forEach((b) => {
-    const name = b.dataset.name;
-    if (b.dataset.act === 'delete') b.addEventListener('click', () => removeModel(name));
-    if (b.dataset.act === 'serve') b.addEventListener('click', () => toggleServe(name));
+    const file = b.dataset.file;
+    if (b.dataset.act === 'delete') b.addEventListener('click', () => removeModel(file));
+    if (b.dataset.act === 'serve') b.addEventListener('click', () => loadModel(file));
   });
 }
 
 /* ------------------------------------------------------------ downloading */
 
-function startDownload(ref) {
-  if (state.pulls.has(ref) && !state.pulls.get(ref).done) return;
+function startDownload(repoId, fileName, _displayName, pullKey) {
+  if (state.pulls.has(pullKey) && !state.pulls.get(pullKey).done) return;
 
   const entry = { status: 'starting…', completed: 0, total: 0, speed: 0, done: false, error: null, t0: Date.now() };
-  state.pulls.set(ref, entry);
+  state.pulls.set(pullKey, entry);
   renderDetail();
 
   const tick = setInterval(() => {
-    const p = state.pulls.get(ref);
+    const p = state.pulls.get(pullKey);
     if (!p || p.done) { clearInterval(tick); return; }
     const node = mainEl.querySelector('.prog');
     if (!node) return;
     node.outerHTML = progressHtml(p);
   }, 400);
 
-  pullModel(ref, (evt) => {
-    const p = state.pulls.get(ref);
+  downloadModel(repoId, [fileName], (evt) => {
+    const p = state.pulls.get(pullKey);
     if (!p) return;
     if (evt.error) { p.error = evt.error; p.done = true; return; }
     p.status = evt.status || p.status;
@@ -918,41 +925,38 @@ function startDownload(ref) {
     if (elapsed > 0.5 && p.completed) p.speed = p.completed / elapsed;
     if (evt.status === 'success') p.done = true;
   }).then(async () => {
-    const p = state.pulls.get(ref);
+    const p = state.pulls.get(pullKey);
     if (p) p.done = true;
     clearInterval(tick);
     await loadLocal();
     renderDetail();
   }).catch((err) => {
-    const p = state.pulls.get(ref);
+    const p = state.pulls.get(pullKey);
     if (p) { p.error = err.message || String(err); p.done = true; }
     clearInterval(tick);
     renderDetail();
   });
 }
 
-async function removeModel(name) {
-  if (!confirm(`Delete ${name} from the model store?`)) return;
+async function removeModel(file) {
+  if (!confirm(`Delete ${file} from the model store?`)) return;
   try {
-    await ollama('/api/delete', {
-      method: 'DELETE',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: name }),
-    });
+    await runner(`/api/models/${encodeURIComponent(file)}`, { method: 'DELETE' });
   } catch (err) { alert(`Could not delete: ${err.message}`); }
   await loadLocal();
   render();
 }
 
-async function toggleServe(name) {
-  const served = isServed(name);
+/** Point the engine at a downloaded GGUF; the supervisor loop reloads it. */
+async function loadModel(file) {
   try {
-    await ollama('/api/generate', {
+    await runner('/api/load', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: name, prompt: '', stream: false, keep_alive: served ? 0 : '30m' }),
+      body: JSON.stringify({ file }),
     });
-  } catch (err) { alert(`Could not ${served ? 'unload' : 'load'}: ${err.message}`); }
+  } catch (err) { alert(`Could not load: ${err.message}`); }
+  await new Promise((r) => setTimeout(r, 1200)); // let the supervisor pick it up
   await loadLocal();
   render();
 }
@@ -961,13 +965,15 @@ async function toggleServe(name) {
 
 function renderLibraryList() {
   if (state.view !== 'library') return;
-  listEl.innerHTML = state.local.length
-    ? state.local.map((m) => `<div class="row${m.name === state.selectedId ? ' sel' : ''}" data-name="${esc(m.name)}">
-        ${avatarHtml(m.name, '')}
+  const q = state.query.toLowerCase();
+  const items = q ? state.local.filter((m) => m.file.toLowerCase().includes(q)) : state.local;
+  listEl.innerHTML = items.length
+    ? items.map((m) => `<div class="row${m.file === state.active ? ' sel' : ''}" data-name="${esc(m.file)}">
+        ${avatarHtml(m.file, '')}
         <div class="row-body">
-          <div class="row-head"><span class="row-title">${esc(m.name)}</span></div>
-          <div class="row-desc">${esc(m.details ? `${m.details.parameter_size || ''} ${m.details.quantization_level || ''}`.trim() : '')}</div>
-          <div class="row-time">${esc(fmtBytes(m.size))}${isServed(m.name) ? ' · serving' : ''}</div>
+          <div class="row-head"><span class="row-title">${esc(m.file)}</span></div>
+          <div class="row-desc">${esc(fmtBytes(m.size))}</div>
+          <div class="row-time">${isServed(m.file) ? 'serving' : 'stopped'}</div>
         </div>
       </div>`).join('')
     : `<div class="empty">Nothing downloaded yet. Find a model in Discover.</div>`;
@@ -977,16 +983,13 @@ function renderLibrary() {
   if (state.view !== 'library') return;
   const hw = state.hw;
   const totalBytes = state.local.reduce((a, m) => a + (m.size || 0), 0);
-  const cpuServed = state.running.filter((m) => !m.size_vram);
 
-  // One banner, chosen by the most actionable problem first. A model actually
-  // spilling onto the CPU outranks a profile that merely predicts it would.
-  const banner = !state.ollamaUp
-    ? `<div class="banner">The model server is not reachable (<code>${esc(CFG.ollama)}</code>).
-        ${esc(state.ollamaErr || '')} Start it with <code>docker compose up -d</code>.</div>`
-    : cpuServed.length
-      ? `<div class="banner warn">${esc(cpuServed.map((m) => m.name).join(', '))} ${cpuServed.length === 1 ? 'is' : 'are'}
-         running on CPU, not the GPU. Expect a large drop in speed.</div>`
+  const banner = !state.runnerUp
+    ? `<div class="banner">The runner is not reachable (<code>${esc(CFG.runner)}</code>).
+        ${esc(state.runnerErr || '')} Start the stack with <code>docker compose up -d</code>.</div>`
+    : (!state.engineUp && state.local.length
+      ? `<div class="banner warn">The engine is not serving yet. Load a model below, or check
+         <code>docker compose logs llama</code> if loading fails.</div>`
       : (!hw.detected
         ? `<div class="banner warn">No <code>hardware.json</code> yet, so fit badges use conservative defaults.
            Run <code>make retune</code> to profile this machine.</div>`
@@ -994,13 +997,13 @@ function renderLibrary() {
           ? `<div class="banner warn">A <strong>${esc(hw.gpu.name)}</strong> was detected, but Docker cannot use it yet,
              so models will run on the CPU. Install <code>nvidia-container-toolkit</code>, then
              <code>make up-gpu</code>.</div>`
-          : ''));
+          : '')));
 
   mainEl.innerHTML = `<div class="detail">
     <div class="lib-head">
       <div>
         <h1 class="d-title">Library</h1>
-        <div class="d-sub">Models stored by the server, and what is currently loaded.</div>
+        <div class="d-sub">GGUF files stored on disk, and which one the engine is serving.</div>
       </div>
       <button class="btn-ghost" id="refreshLib">${svg(ICON.refresh)} Refresh</button>
     </div>
@@ -1010,15 +1013,14 @@ function renderLibrary() {
     <div class="stat">
       <div><span>Models</span><b>${state.local.length}</b></div>
       <div><span>On disk</span><b>${esc(fmtBytes(totalBytes))}</b></div>
-      <div><span>Serving</span><b>${state.running.length}</b></div>
+      <div><span>Serving</span><b>${state.engineUp && state.active ? 1 : 0}</b></div>
       <div><span>VRAM budget</span><b>${Number(hw.gpu.vramUsableGB) > 0 ? Number(hw.gpu.vramUsableGB).toFixed(0) + ' GB' : '--'}</b></div>
     </div>
 
     <h2 class="section">Endpoints</h2>
     <div class="box">
-      ${endpointHtml('Ollama API', `${location.protocol}//${location.hostname}:${CFG.ollamaPort || 11435}`)}
-      ${endpointHtml('OpenAI API', `${location.protocol}//${location.hostname}:${CFG.ollamaPort || 11435}/v1`)}
-      <div class="prose-note">Point any Ollama or OpenAI-compatible client at these addresses.</div>
+      ${endpointHtml('OpenAI API', `${location.protocol}//${location.hostname}:${CFG.llamaPort || 8081}/v1`)}
+      <div class="prose-note">Point any OpenAI-compatible client at this address. The model name is the loaded GGUF file.</div>
     </div>
 
     <h2 class="section">System</h2>
@@ -1042,22 +1044,19 @@ function renderLibrary() {
 
     <h2 class="section">Models</h2>
     ${state.local.length ? state.local.map((m) => {
-      const served = servedInfo(m.name);
-      const onGpu = served && served.size_vram > 0;
+      const served = isServed(m.file);
       return `<div class="mrow">
         <div class="m-body">
-          <div class="m-name">${esc(m.name)}</div>
+          <div class="m-name">${esc(m.file)}</div>
           <div class="m-meta">
             <span class="dot${served ? ' on' : ''}"><i></i>${served ? 'serving' : 'stopped'}</span>
             <span>${esc(fmtBytes(m.size))}</span>
-            ${m.details && m.details.parameter_size ? `<span>${esc(m.details.parameter_size)}</span>` : ''}
-            ${m.details && m.details.quantization_level ? `<span>${esc(m.details.quantization_level)}</span>` : ''}
-            ${served ? `<span>${onGpu ? 'GPU' : 'CPU'} ${esc(fmtBytes(served.size_vram || 0))} / ${esc(fmtBytes(served.size || 0))}</span>` : ''}
+            <span>${esc(fromNow(m.mtime))}</span>
           </div>
         </div>
         <div class="m-actions">
-          <button class="btn-ghost" data-act="serve" data-name="${esc(m.name)}">${served ? svg(ICON.stop) : svg(ICON.play)}${served ? 'Unload' : 'Load'}</button>
-          <button class="btn-ghost danger" data-act="delete" data-name="${esc(m.name)}">${svg(ICON.trash)}</button>
+          <button class="btn-ghost" data-act="serve" data-file="${esc(m.file)}">${svg(ICON.play)}${served ? 'Reload' : 'Load'}</button>
+          <button class="btn-ghost danger" data-act="delete" data-file="${esc(m.file)}">${svg(ICON.trash)}</button>
         </div>
       </div>`;
     }).join('') : `<div class="empty">No models on disk yet.</div>`}
@@ -1065,9 +1064,9 @@ function renderLibrary() {
 
   $('#refreshLib').addEventListener('click', async () => { await loadLocal(); render(); });
   $$('[data-act]', mainEl).forEach((b) => {
-    const name = b.dataset.name;
-    if (b.dataset.act === 'delete') b.addEventListener('click', () => removeModel(name));
-    if (b.dataset.act === 'serve') b.addEventListener('click', () => toggleServe(name));
+    const file = b.dataset.file;
+    if (b.dataset.act === 'delete') b.addEventListener('click', () => removeModel(file));
+    if (b.dataset.act === 'serve') b.addEventListener('click', () => loadModel(file));
   });
 }
 
@@ -1171,7 +1170,10 @@ function wireList() {
     if (state.view === 'discover' && row.dataset.id) {
       if (row.dataset.id !== state.selectedId) selectModel(row.dataset.id);
     } else if (state.view === 'library' && row.dataset.name) {
-      state.selectedId = row.dataset.name;
+      // Clicking a library row loads that model in the engine.
+      const file = row.dataset.name;
+      if (file !== state.active) loadModel(file);
+      state.active = file;
       renderLibraryList();
       renderLibrary();
     }
@@ -1205,7 +1207,7 @@ async function init() {
   await Promise.all([loadHardware(), loadLocal()]);
   await loadDiscover();
 
-  // Keep served state fresh without hammering the daemon. Only the Library is
+  // Keep served state fresh without hammering the engine. Only the Library is
   // repainted on a timer -- redrawing the Discover detail panel would collapse
   // an open quant menu and throw away the reader's scroll position.
   setInterval(async () => {

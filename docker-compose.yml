@@ -2,38 +2,74 @@ name: llm-hub
 
 services:
   # ---------------------------------------------------------------------------
-  # Model server. Serves an Ollama HTTP API (and an OpenAI-compatible /v1).
-  # Downloads GGUF models straight from Hugging Face, e.g.
-  #   ollama pull hf.co/bartowski/Qwen2.5-Coder-7B-Instruct-GGUF:Q4_K_M
+  # Model engine: llama.cpp server (what LM Studio runs under the hood).
+  # Serves an OpenAI-compatible API on :8080 and loads one .gguf file from the
+  # models volume. The `runner` sidecar picks which file via /models/.active.
   # ---------------------------------------------------------------------------
-  ollama:
-    image: ollama/ollama:latest
-    container_name: llm-hub-ollama
+  llama:
+    image: ghcr.io/ggml-org/llama.cpp:server-cuda
+    container_name: llm-hub-llama
     restart: unless-stopped
     ports:
-      - "${OLLAMA_PORT:-11435}:11434"
+      - "${LLAMA_PORT:-8081}:8080"
     volumes:
-      - ollama-models:/root/.ollama
+      - models:/models
     environment:
-      # Let the browser talk to the API directly if you bypass the nginx proxy.
-      OLLAMA_ORIGINS: "${OLLAMA_ORIGINS:-*}"
-      OLLAMA_KEEP_ALIVE: "${OLLAMA_KEEP_ALIVE:-30m}"
-      OLLAMA_CONTEXT_LENGTH: "${OLLAMA_CONTEXT_LENGTH:-16384}"
-      OLLAMA_KV_CACHE_TYPE: "${OLLAMA_KV_CACHE_TYPE:-q8_0}"
-      OLLAMA_FLASH_ATTENTION: "${OLLAMA_FLASH_ATTENTION:-1}"
-      OLLAMA_NUM_PARALLEL: "${OLLAMA_NUM_PARALLEL:-1}"
-      OLLAMA_MAX_LOADED_MODELS: "${OLLAMA_MAX_LOADED_MODELS:-1}"
+      LLAMA_CTX_SIZE: "${LLAMA_CTX_SIZE:-8192}"
+      LLAMA_CACHE_TYPE_K: "${LLAMA_CACHE_TYPE_K:-q8_0}"
+      LLAMA_FLASH_ATTN: "${LLAMA_FLASH_ATTN:-1}"
+      LLAMA_N_GPU_LAYERS: "${LLAMA_N_GPU_LAYERS:--1}"
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        # Supervisor loop: watch /models/.active and (re)start llama-server
+        # whenever the selected model changes. Uses only long-stable flags.
+        while true; do
+          M=$(cat /models/.active 2>/dev/null || true)
+          if [ -n "$$M" ] && [ -f "/models/$$M" ]; then
+            echo "[llm-hub] serving /models/$$M"
+            FA=""; [ "$LLAMA_FLASH_ATTN" = "1" ] && FA="-fa"
+            /app/llama-server \
+              -m "/models/$$M" \
+              --host 0.0.0.0 --port 8080 \
+              -c "$$LLAMA_CTX_SIZE" \
+              --cache-type-k "$$LLAMA_CACHE_TYPE_K" \
+              -ngl "$$LLAMA_N_GPU_LAYERS" \
+              $$FA \
+              --parallel 1
+            echo "[llm-hub] server exited, restarting in 2s"
+          fi
+          sleep 2
+        done
     healthcheck:
-      test: ["CMD-SHELL", "ollama list >/dev/null 2>&1 || exit 1"]
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/health || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 30
-      start_period: 20s
+      start_period: 30s
 
   # ---------------------------------------------------------------------------
-  # Web GUI. Static Hugging Face style model browser + local model library.
-  # nginx also reverse-proxies /ollama/ to the service above, so the browser
-  # makes same-origin calls and download progress streams unbuffered.
+  # Runner: the LM Studio piece Ollama gives you for free. Downloads raw .gguf
+  # files straight from Hugging Face into /models (with streaming progress),
+  # lists and deletes them, and switches the active model by rewriting
+  # /models/.active -- the supervisor above picks it up within 2 seconds.
+  # ---------------------------------------------------------------------------
+  runner:
+    image: node:22-alpine
+    container_name: llm-hub-runner
+    restart: unless-stopped
+    working_dir: /srv
+    command: node index.js
+    volumes:
+      - models:/models
+      - ./downloader:/srv:ro
+    environment:
+      MODELS_DIR: /models
+      PORT: "3000"
+
+  # ---------------------------------------------------------------------------
+  # Web GUI. Static model browser; nginx proxies /llama/ to the engine and
+  # /downloader/ to the runner so the browser is always same-origin.
   # ---------------------------------------------------------------------------
   webgui:
     image: nginx:alpine
@@ -45,8 +81,9 @@ services:
       - ./webgui:/usr/share/nginx/html:ro
       - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
     depends_on:
-      - ollama
+      - llama
+      - runner
 
 volumes:
-  ollama-models:
+  models:
     name: llm-hub-models
