@@ -1,0 +1,27 @@
+# GPU passthrough overlay.
+#
+# The base compose file runs Ollama on CPU, which is 6-30x slower. To put the
+# GPU in the container you need the NVIDIA Container Toolkit installed on the
+# host first:
+#
+#   sudo pacman -S nvidia-container-toolkit
+#   sudo nvidia-ctk runtime configure --runtime=docker
+#   sudo systemctl restart docker
+#
+# Then bring the stack up with both files:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
+#   # or: make up-gpu
+#
+# Verify the container can see the card:
+#
+#   docker exec llm-hub-ollama nvidia-smi -L
+services:
+  ollama:
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

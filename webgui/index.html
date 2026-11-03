@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LLM Hub</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="app">
+
+  <!-- ===================== sidebar ===================== -->
+  <aside class="sidebar">
+    <div class="sidebar-top">
+      <div class="tabs" role="tablist">
+        <button class="tab active" data-view="discover" role="tab">Discover</button>
+        <button class="tab" data-view="library" role="tab">Library</button>
+      </div>
+
+      <label class="search">
+        <svg viewBox="0 0 24 24" class="ic" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+        <input id="search" type="search" autocomplete="off" spellcheck="false"
+               placeholder="Search Hugging Face and staff picks">
+      </label>
+
+      <div class="filters">
+        <button id="staffBtn" class="staff" title="Only show curated GGUF publishers">
+          <span>Staff picks</span>
+          <svg viewBox="0 0 24 24" class="ic sm" aria-hidden="true"><path d="M7 4v16M7 20l-3-3M7 20l3-3M17 20V4M17 4l-3 3M17 4l3 3"/></svg>
+        </button>
+        <div class="dd" id="sortDD">
+          <button class="dd-btn" id="sortBtn" aria-haspopup="listbox">
+            <span id="sortLabel">Best for this device</span>
+            <svg viewBox="0 0 24 24" class="ic sm" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+          </button>
+          <div class="dd-menu hidden" id="sortMenu" role="listbox"></div>
+        </div>
+      </div>
+    </div>
+
+    <div id="list" class="list" aria-live="polite"></div>
+  </aside>
+
+  <!-- ===================== main ===================== -->
+  <main id="main" class="main"></main>
+</div>
+
+<script src="config.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
