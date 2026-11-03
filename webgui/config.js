@@ -1,18 +1,18 @@
 // Runtime configuration for the LLM Hub web GUI.
 // Edit this file, then just reload the page -- no rebuild needed.
 window.LLM_HUB = {
-  // Model server endpoint. "/ollama" is reverse-proxied to the ollama service
-  // by nginx.conf, so requests are same-origin and progress streams unbuffered.
-  //
-  // To drive a different machine instead, use its direct URL, e.g.
-  //   ollama: "http://192.168.1.50:11434"
-  // and make sure that server allows this page's origin via OLLAMA_ORIGINS.
-  ollama: "/ollama",
+  // Engine (llama.cpp server, OpenAI-compatible API), reverse-proxied by nginx
+  // so requests are same-origin. To reach another machine directly, use e.g.
+  //   llama: "http://192.168.1.50:8081"
+  llama: "/llama",
 
-  // Port the Ollama API is published on. Used only to display the endpoint
-  // URLs in the Library; the GUI itself always talks through `ollama` above.
-  // Keep in step with OLLAMA_PORT in .env.
-  ollamaPort: 11435,
+  // Runner: downloads GGUF files from Hugging Face and manages /models.
+  runner: "/downloader",
+
+  // Port the engine's OpenAI API is published on. Used only to display the
+  // endpoint URLs in the Library; the GUI itself always talks through `llama`.
+  // Keep in step with LLAMA_PORT in .env.
+  llamaPort: 8081,
 
   // Public Hugging Face API (CORS enabled, no token needed for public repos).
   hf: "https://huggingface.co",
